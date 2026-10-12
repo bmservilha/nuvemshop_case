@@ -9,12 +9,14 @@ dependencies = [
     "jupyterlab>=4.6.4",
     "lightgbm>=4.7.0",
     "matplotlib>=3.11.2",
+    "mlflow>=3.17.0",
     "numpy>=2.5.3",
     "optuna>=5.0.0",
     "pandas>=3.0.6",
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
     "seaborn>=0.13.2",
+    "shap>=0.53.0",
     "statsmodels>=0.15.0",
 ]
 
