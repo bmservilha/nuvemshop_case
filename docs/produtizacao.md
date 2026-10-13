@@ -1,72 +1,160 @@
 # Produtização do modelo de fraude
 
-Esboço de como colocar o LightGBM campeão (notebooks 3 e 4) atrás de um endpoint e integrá-lo a um motor de decisão em tempo quase real (NRT).
+Como colocar em produção o esquema **champion / challenger** construído nos notebooks 2 e 3, integrado a um motor de decisão em tempo quase real (NRT).
+
+* **Champion**: regressão logística `logreg_6`, registrada no MLflow como `nuvemshop-fraud@champion` (threshold 0,085). Decide as transações.
+* **Challenger**: LightGBM com as **mesmas 6 variáveis**. Pontua todo o tráfego em paralelo, mas não decide.
+
+Este documento foca nas decisões de desenho e seus tradeoffs, não em ferramentas. Onde há nomes de tecnologia, são exemplos. Qualquer equivalente serve.
 
 ## Visão geral
 
 ```
- Checkout ──► Motor de decisão ──► Serviço de features ──┬─► Feature store online (Redis/DynamoDB)
-                 │       ▲                               │     ├─ perfil do cliente (batch diário)
-                 │       │                               │     ├─ perfil da loja (batch diário)
-                 │       │                               │     └─ contadores de velocidade (streaming)
-                 │       │                               └─► features da requisição (valor, horário)
-                 ▼       │
-           Endpoint do modelo (score)
+                         ┌──────────────── OFFLINE (batch diário, D-1) ────────────────┐
+  data lake (transações, │  job de features ──► feature store offline                  │
+  chargebacks)  ─────────┤                      ├─ perfil do cliente  (customer_id)    │──► base de treino
+                         │                      └─ perfil do lojista  (store_id)       │    (point-in-time)
+                         └──────────────────────────────┬──────────────────────────────┘
+                                                        │ materialização diária
+                                                        ▼
+                                              store online (chave-valor)
+                                                        ▲
+                                                        │ contadores intradiários
+                              eventos de transação ─────┘ (janelas 1h / 24h)
+
+ Checkout ──► Motor de decisão NRT
+                 1. features da requisição (valor, horário)
+                 2. lookup em paralelo: perfil cliente + perfil lojista + contadores
+                 3. regras duras
+                 4. score CHAMPION (logreg, in-process) ──► threshold ──► aprovar / bloquear
+                 5. responde ao checkout
                  │
-                 ▼
-     Regras + threshold ──► aprovar / revisar / bloquear
-                 │
-                 ▼
-     Log de decisão (Kafka) ──► data lake ──► monitoramento, re-treino, chargebacks (rótulos)
+                 └─► evento de decisão (features servidas, scores, versão) ──► log
+                                    │
+                                    ├─► CHALLENGER (LightGBM) pontua assíncrono ──► log
+                                    └─► data lake ──► monitoramento, rótulos (chargeback), re-treino
 ```
 
-Meta de latência: p99 < 100 ms para a cadeia inteira; o modelo sozinho (5 variáveis, ~100 árvores) responde em menos de 5 ms.
+## 1. Variáveis e onde cada uma é calculada
 
-## 1. Endpoint do modelo
-
-* **Empacotamento**: o modelo já está registrado no MLflow. A versão campeã é promovida no Model Registry (alias `champion`), junto com o threshold de decisão (0,113), a lista de variáveis e o mapeamento vertical → grupo de risco como artefatos da mesma versão. Assim modelo, pré-processamento e threshold são versionados juntos.
-* **Serviço**: um container stateless (FastAPI ou `mlflow models serve`) com uma rota `POST /score` que recebe as variáveis já montadas e devolve `score`, `model_version` e, opcionalmente, os 3 maiores valores SHAP (TreeExplainer é barato com 5 variáveis) para o analista de revisão manual.
-* **Infra**: Kubernetes/ECS com autoscaling por CPU ou RPS, no mínimo duas réplicas em zonas diferentes. Alternativa gerenciada: endpoint do SageMaker.
-* **Implantação segura**: primeiro em *shadow* (pontua o tráfego real e loga, sem decidir), depois canário (5% → 50% → 100%) comparando taxa de bloqueio e distribuição do score com o modelo/regra atual. Rollback = trocar o alias no registry.
-
-## 2. Features: offline e online
-
-O ponto crítico é **paridade treino/produção**: a mesma definição de cada variável é usada para gerar a base de treino (point-in-time) e para servir em produção. Uma feature store (Feast, Tecton, SageMaker Feature Store) organiza isso.
+Cada uma das 6 variáveis do modelo tem uma origem natural. A divisão entre offline e online é a principal decisão de arquitetura.
 
 | Variável | Origem | Atualização | Como chega na decisão |
 |---|---|---|---|
-| `amount`, `high_amount` | requisição | — | calculada no motor |
+| `high_amount` (valor > 200) | requisição | — | calculada no motor |
 | `night` (22h–03h UTC) | requisição (timestamp) | — | calculada no motor, sempre em UTC |
-| `vertical_group` | **perfil da loja** (offline) | batch diário | lookup por `store_id` na store online |
-| `amount_to_customer_median_ratio_30d` | **perfil do cliente** (offline) | batch diário | lookup da mediana 30d por `customer_id`; a razão é calculada no motor com o valor da transação |
-| `txns_prev_1h` | **velocidade** (online) | streaming, por evento | contador por `customer_id` em janela deslizante de 1h |
+| `risk_vertical` | **perfil do lojista** (offline) | batch diário | lookup por `store_id` |
+| `amount_to_customer_median_ratio_30d_gt_5` | **perfil do cliente** (offline) | batch diário | lookup da mediana 30d por `customer_id`; a razão e a flag são calculadas no motor com o valor da transação |
+| `n_high_prev_24h` | **perfil do cliente** (offline) + contador intradiário | D-1 + incremental | ver seção 2.3 |
+| `txns_prev_1h` | contador de velocidade (online) | por evento | contador por `customer_id`, janela `[t − 1h, t)` |
 
-**Offline (perfil do cliente e da loja)**: um job diário (Spark/dbt sobre o data lake) calcula a mediana de valor do cliente em 30 dias, a vertical/grupo de risco da loja e outros atributos de perfil. O resultado vai para a store offline (para treino) e é materializado na store online (chave-valor, leitura em ~1 ms). Cliente sem histórico → valor nulo, que o LightGBM já trata nativamente (mesmo comportamento do treino).
+Pelos coeficientes do notebook 3, as variáveis que **efetivamente fazem bloquear** são as comportamentais (`n_high_prev_24h`, razão sobre a mediana do cliente). `high_amount` e `night` sozinhas não passam do threshold. Isso define a prioridade de engenharia: as features de perfil do cliente são as mais críticas para a qualidade da decisão, e são justamente as que dependem de histórico.
 
-**Online (velocidade)**: cada transação aprovada ou tentada é publicada num tópico Kafka. Um consumidor (Flink ou Kafka Streams) mantém, por cliente, a contagem de transações na última hora e grava na store online. Duas precauções:
+## 2. Feature stores offline: perfil do cliente e perfil do lojista
 
-* a janela é `[t − 1h, t)`, **sem a transação atual**, igual ao treino;
-* se o streaming atrasar, o motor pode contar direto no Redis (sorted set com timestamps por cliente: `ZADD` + `ZCOUNT`), uma solução simples e com consistência forte.
+### 2.1 Perfil do cliente (`customer_id`)
 
-**Horário** é derivado do timestamp da própria requisição, sem consulta externa.
+Job diário sobre o data lake, que calcula para cada cliente:
+
+* mediana do valor das transações nos últimos 30 dias;
+* número de transações de valor alto no dia anterior (base do `n_high_prev_24h`);
+* atributos de apoio para modelos futuros: idade do cliente na base, nº de transações em 30d, nº de chargebacks históricos.
+
+### 2.2 Perfil do lojista (`store_id`)
+
+* vertical da loja e flag `risk_vertical`;
+* candidatos para versões seguintes: taxa histórica de chargeback da loja, ticket médio, tempo de plataforma.
+
+O perfil do lojista muda devagar, então um batch diário (ou até semanal) é suficiente.
+
+### 2.3 Integração no cálculo NRT
+
+A store offline serve dois consumidores com **a mesma definição de feature**:
+
+1. **Treino**: a base de treino é montada com *point-in-time join*. Cada transação recebe o perfil como ele estava **antes** dela, nunca depois. É o que os notebooks fazem implicitamente com janelas `[t − janela, t)`.
+2. **Produção**: o resultado do batch é materializado numa store online chave-valor (leitura em ~1 ms). O motor consulta `customer_id` e `store_id` em paralelo.
+
+O ponto delicado é a janela de **24h**. Um perfil D-1 sozinho não enxerga as transações de hoje, e é exatamente a "rajada" intradiária que a variável captura. A solução proposta é **híbrida**:
+
+* parte histórica (antes da meia-noite) vem do batch;
+* parte do dia corrente vem de um contador incremental, atualizado a cada transação (ex.: estrutura ordenada por timestamp por cliente na própria store online);
+* o motor soma as duas e descarta o que estiver fora de `[t − 24h, t)`.
+
+`txns_prev_1h` é puramente online, porque uma janela de 1h não faz sentido em batch.
+
+Cliente sem histórico: a mediana é nula e a flag fica 0, como no treino (`fillna(0)` no notebook 2). Isso deve ser uma regra explícita e compartilhada entre treino e produção, não um detalhe de código.
+
+### Tradeoffs das features
+
+| Decisão | Ganho | Custo / risco |
+|---|---|---|
+| Perfil por **batch diário** | simples, barato, fácil de reproduzir no treino | feature até 24h desatualizada; cliente novo do dia não tem perfil |
+| Contadores em **streaming** | pega a rajada em tempo real | mais infraestrutura, eventos atrasados ou duplicados, mais difícil de reproduzir no treino |
+| **Híbrido** (D-1 + incremental) | frescor onde importa (24h, 1h), batch onde não importa (30d, lojista) | duas fontes para somar; risco de contar duas vezes ou perder eventos na virada do dia |
+| Calcular a razão/flag **no motor** em vez de pré-calcular | usa o valor da transação atual | a regra (`> 5`) fica no código do motor e precisa ser versionada junto com o modelo |
+| Uma feature store dedicada vs. tabelas + cache | paridade treino/produção garantida pela ferramenta | ferramenta pesada para 6 variáveis; no início, uma tabela versionada e um cache chave-valor resolvem, desde que a definição de cada feature seja um código único usado nos dois lados |
+
+**Recomendação inicial**: perfis do cliente e do lojista em batch diário, contadores de 1h e 24h incrementais na store online, e uma única biblioteca de definição de features importada tanto pelo job de treino quanto pelo motor.
 
 ## 3. Motor de decisão NRT
 
 Fluxo síncrono para cada transação:
 
-1. **Recebe** a transação do checkout (`transaction_id`, `customer_id`, `store_id`, `amount`, `created_at`).
-2. **Enriquece**: busca em paralelo o perfil do cliente, o perfil da loja e o contador de velocidade na store online (timeout curto, ~20 ms) e calcula as variáveis da requisição.
-3. **Regras duras** antes do modelo: listas de bloqueio/permissão, limites regulatórios, regras de velocidade extremas (ex.: > 8 transações/hora → bloqueio direto).
-4. **Pontua** chamando o endpoint do modelo.
-5. **Decide** com o threshold versionado: `score ≥ 0,113` → bloquear. Uma faixa intermediária pode ir para revisão manual, se a operação comportar.
-6. **Responde** ao checkout e **publica** o evento de decisão (features usadas, score, versão do modelo, decisão) no Kafka. Esse log é a base do monitoramento e do re-treino, e evita o *training-serving skew*: o modelo seguinte é treinado com as features exatamente como foram servidas.
+1. **Recebe** a transação (`txn_id`, `customer_id`, `store_id`, `amount`, `created_at`).
+2. **Enriquece**: lookup em paralelo do perfil do cliente, do perfil do lojista e dos contadores, com timeout curto (~20 ms). Calcula `high_amount`, `night` e a razão sobre a mediana.
+3. **Regras duras**: listas de bloqueio/permissão e limites extremos de velocidade.
+4. **Pontua com o champion**: a regressão logística tem 6 coeficientes e um intercepto, então dá para pontuar **dentro do próprio motor**, sem chamar outro serviço. O modelo é carregado do registry (ou do `models/logreg_champion.pkl`) junto com threshold e lista de features.
+5. **Decide**: `score ≥ 0,085` → bloquear.
+6. **Responde** ao checkout e **publica** o evento de decisão com as features exatamente como foram servidas, o score, a versão do modelo e a decisão.
 
-**Fallback**: se o endpoint ou a store online falharem ou estourarem o timeout, o motor cai para a regra atual (`amount > 200` combinada com vertical/horário) em vez de travar o checkout. A taxa de fallback é monitorada.
+**Fallback**: se a store online falhar ou estourar o timeout, o motor cai na regra `amount > 200` (o "Run 0" do notebook 2), em vez de travar o checkout. A taxa de fallback é monitorada. A regra é conhecida e segura, mas o notebook 2 mostra que ela tem custo negativo no teste, então o fallback precisa ser exceção.
 
-## 4. Monitoramento e ciclo de vida
+Meta de latência: p99 < 100 ms para a cadeia inteira, dominada pelos lookups. A pontuação da regressão logística é desprezível (microssegundos).
 
-* **Operacional**: latência p50/p99, erros, taxa de fallback, freshness das features (idade do último batch, atraso do streaming).
-* **Dados**: PSI/drift das 5 variáveis e do score frente ao período de treino; proporção de nulos na razão de 30d.
-* **Negócio**: taxa de bloqueio diária, taxa de revisão e, com o atraso do chargeback (~1 mês, como os gaps do split temporal), recall, precisão e custo realizado.
-* **Calibração**: razão score médio / taxa de fraude observada. O notebook 4 mostrou que ela sobe (1,0 no treino → 1,5 no teste) com a queda da taxa de fraude. Recalibração Platt periódica numa janela recente, se o score for usado como probabilidade.
-* **Re-treino**: mensal ou disparado por drift/queda de desempenho, sempre com split temporal e gap de maturação. O novo modelo passa por shadow → canário antes de virar `champion`, e o threshold é reotimizado pelo custo a cada versão.
+## 4. Champion / challenger
+
+### Como o challenger roda
+
+O LightGBM **não fica no caminho síncrono**. Ele consome o log de decisões e pontua cada transação com as **mesmas features já servidas ao champion**. Isso garante comparação justa, pois os dois modelos veem exatamente a mesma entrada, e não acrescenta latência ao checkout.
+
+Para cada transação, ficam registrados: score do champion, score do challenger, decisão tomada e decisão que o challenger teria tomado (com o threshold dele, otimizado por custo na validação).
+
+### Como comparar
+
+Os rótulos chegam com atraso (~1 mês de maturação do chargeback, o mesmo gap do split temporal). A comparação é feita por **safra madura**:
+
+* PR-AUC, KS e recall de cada modelo;
+* **custo realizado** com `decision_pnl`: o custo do challenger é contrafactual, aplicado às transações que ele teria bloqueado ou aprovado;
+* análise das **discordâncias**: transações que um bloqueia e o outro não. É onde a diferença de custo aparece de fato.
+
+Limitação: as transações bloqueadas pelo champion não geram chargeback, então não se sabe com certeza se eram fraude. Para medir o challenger sem viés, é útil reservar uma pequena fração de tráfego (ex.: 1–2% abaixo de um teto de valor) onde a decisão não é aplicada, ou é aplicada pelo challenger.
+
+### Critério de promoção
+
+O challenger vira champion se, por **pelo menos 2–3 safras maduras**:
+
+* economia maior que a do champion por margem relevante (no notebook 2 a diferença foi de ~R$ 3,8 mil no teste, ~7%);
+* taxa de bloqueio e precisão estáveis, sem picos em subgrupos de lojistas;
+* explicabilidade aceitável para a operação (ver tradeoffs).
+
+A promoção é trocar o alias no registry (`challenger` → `champion`). O modelo anterior vira o novo challenger, o que dá rollback imediato.
+
+### Tradeoffs champion / challenger
+
+| Decisão | Ganho | Custo / risco |
+|---|---|---|
+| **Logística como champion** | cada decisão se explica pela soma dos coeficientes (notebook 3); auditoria e contestação de lojistas simples; pontuação dentro do motor | deixa ~7% de economia na mesa frente ao LightGBM |
+| **LightGBM como champion** | maior economia e menor taxa de bloqueio no teste | explicação por SHAP/LIME; serviço de modelo separado ou biblioteca nativa no motor; mais difícil de auditar |
+| Challenger **assíncrono** (shadow) | zero risco e zero latência no checkout | só compara com rótulos maduros; viés de seleção nos bloqueados |
+| Challenger em **canário** (decide parte do tráfego) | mede o efeito real da decisão | expõe clientes e lojistas a um modelo menos validado |
+| **Mesmas features** nos dois modelos | comparação isola só o algoritmo; uma única pipeline de features | um challenger com features novas exige que elas já estejam na feature store, logadas desde o início |
+
+A escolha da logística como champion inicial é deliberada. A diferença de economia é pequena perto do ganho de explicabilidade numa primeira versão, e o shadow do LightGBM acumula evidência em produção, não só no teste.
+
+## 5. Monitoramento e ciclo de vida
+
+* **Operacional**: latência p50/p99, taxa de fallback, freshness das features (idade do último batch, atraso dos contadores).
+* **Dados**: drift (PSI) das 6 variáveis e dos dois scores; proporção de clientes sem perfil.
+* **Negócio, por safra madura**: taxa de bloqueio, recall, precisão e custo realizado do champion e do challenger, lado a lado.
+* **Threshold**: o notebook 3 mostra que o ótimo do teste (0,26) é mais alto que o da validação (0,085), por causa da queda da taxa de fraude. Reotimizar o threshold por custo a cada safra madura é mais barato que retreinar e recupera parte desses ~R$ 5 mil.
+* **Re-treino**: mensal ou disparado por drift, sempre com split temporal e gap de maturação. Todo modelo novo entra como challenger antes de poder virar champion.

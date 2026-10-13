@@ -10,7 +10,6 @@ import pandas as pd
 
 CHARGEBACK_FEE = 15.0
 MARGIN = 0.10
-REVIEW_COST = 5.0
 
 
 def decision_pnl(
@@ -18,9 +17,8 @@ def decision_pnl(
     blocked,
     amount,
     chargeback_fee: float = CHARGEBACK_FEE,
-    margin: float = MARGIN,
-    review_cost: float = REVIEW_COST,
-) -> dict[str, float]:
+    margin: float = MARGIN
+ ) -> dict[str, float]:
     """Matriz de confusão e custo total (R$) de uma decisão de bloqueio."""
     y = np.asarray(y_true).astype(bool)
     b = np.asarray(blocked).astype(bool)
@@ -29,7 +27,7 @@ def decision_pnl(
     fn = y & ~b
     fp = ~y & b
     fn_cost = (a[fn] + chargeback_fee).sum()
-    fp_cost = (margin * a[fp] + review_cost).sum()
+    fp_cost = (margin * a[fp] ).sum()
     approve_all_cost = (a[y] + chargeback_fee).sum()
     total_cost = fn_cost + fp_cost
 
@@ -56,7 +54,6 @@ def threshold_cost_curve(
     amount,
     chargeback_fee: float = CHARGEBACK_FEE,
     margin: float = MARGIN,
-    review_cost: float = REVIEW_COST,
 ) -> pd.DataFrame:
     """Custo total para cada threshold candidato (bloqueia se score >= threshold).
 
@@ -73,7 +70,7 @@ def threshold_cost_curve(
     # Custo de bloquear cada transação em relação a aprová-la:
     # fraude bloqueada economiza amount + fee; legítima bloqueada custa margem + análise.
     approve_all_cost = (a[y] + chargeback_fee).sum()
-    delta = np.where(y, -(a + chargeback_fee), margin * a + review_cost)
+    delta = np.where(y, -(a + chargeback_fee), margin * a )
 
     # Bloquear o top-k: considera apenas o último índice de cada score (empates)
     last_of_tie = np.r_[s[1:] != s[:-1], True]
